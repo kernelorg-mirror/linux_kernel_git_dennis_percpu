@@ -12,7 +12,7 @@
 
 #ifdef CONFIG_HOTPLUG_CPU
 static LIST_HEAD(percpu_counters);
-static DEFINE_SPINLOCK(percpu_counters_lock);
+static DEFINE_RAW_SPINLOCK(percpu_counters_lock);
 #endif
 
 #ifdef CONFIG_DEBUG_OBJECTS_PERCPU_COUNTER
@@ -126,13 +126,8 @@ EXPORT_SYMBOL(percpu_counter_sync);
  * Add up all the per-cpu counts, return the result.  This is a more accurate
  * but much slower version of percpu_counter_read_positive().
  *
- * We use the cpu mask of (cpu_online_mask | cpu_dying_mask) to capture sums
- * from CPUs that are in the process of being taken offline. Dying cpus have
- * been removed from the online mask, but may not have had the hotplug dead
- * notifier called to fold the percpu count back into the global counter sum.
- * By including dying CPUs in the iteration mask, we avoid this race condition
- * so __percpu_counter_sum() just does the right thing when CPUs are being taken
- * offline.
+ * Note: This function is inherently racy against the lockless fastpath of
+ * percpu_counter_add_batch() unless externaly serialized.
  */
 s64 __percpu_counter_sum(struct percpu_counter *fbc)
 {
@@ -142,10 +137,8 @@ s64 __percpu_counter_sum(struct percpu_counter *fbc)
 
 	raw_spin_lock_irqsave(&fbc->lock, flags);
 	ret = fbc->count;
-	for_each_cpu_or(cpu, cpu_online_mask, cpu_dying_mask) {
-		s32 *pcount = per_cpu_ptr(fbc->counters, cpu);
-		ret += *pcount;
-	}
+	for_each_online_cpu(cpu)
+		ret += *per_cpu_ptr(fbc->counters, cpu);
 	raw_spin_unlock_irqrestore(&fbc->lock, flags);
 	return ret;
 }
@@ -181,10 +174,10 @@ int __percpu_counter_init_many(struct percpu_counter *fbc, s64 amount,
 	}
 
 #ifdef CONFIG_HOTPLUG_CPU
-	spin_lock_irqsave(&percpu_counters_lock, flags);
+	raw_spin_lock_irqsave(&percpu_counters_lock, flags);
 	for (i = 0; i < nr_counters; i++)
 		list_add(&fbc[i].list, &percpu_counters);
-	spin_unlock_irqrestore(&percpu_counters_lock, flags);
+	raw_spin_unlock_irqrestore(&percpu_counters_lock, flags);
 #endif
 	return 0;
 }
@@ -205,10 +198,10 @@ void percpu_counter_destroy_many(struct percpu_counter *fbc, u32 nr_counters)
 		debug_percpu_counter_deactivate(&fbc[i]);
 
 #ifdef CONFIG_HOTPLUG_CPU
-	spin_lock_irqsave(&percpu_counters_lock, flags);
+	raw_spin_lock_irqsave(&percpu_counters_lock, flags);
 	for (i = 0; i < nr_counters; i++)
 		list_del(&fbc[i].list);
-	spin_unlock_irqrestore(&percpu_counters_lock, flags);
+	raw_spin_unlock_irqrestore(&percpu_counters_lock, flags);
 #endif
 
 	free_percpu(fbc[0].counters);
@@ -221,22 +214,29 @@ EXPORT_SYMBOL(percpu_counter_destroy_many);
 int percpu_counter_batch __read_mostly = 32;
 EXPORT_SYMBOL(percpu_counter_batch);
 
-static int compute_batch_value(unsigned int cpu)
+static void compute_batch_value(int offs)
 {
-	int nr = num_online_cpus();
+	int nr = num_online_cpus() + offs;
 
-	percpu_counter_batch = max(32, nr*2);
+	percpu_counter_batch = max(32, nr * 2);
+}
+
+static int percpu_counter_cpu_starting(unsigned int cpu)
+{
+	/* If invoked during hotplug @cpu is not yet marked online. */
+	compute_batch_value(cpu_online(cpu) ? 0 : 1);
 	return 0;
 }
 
-static int percpu_counter_cpu_dead(unsigned int cpu)
+static int percpu_counter_cpu_dying(unsigned int cpu)
 {
 #ifdef CONFIG_HOTPLUG_CPU
 	struct percpu_counter *fbc;
+	unsigned long flags;
 
-	compute_batch_value(cpu);
+	compute_batch_value(0);
 
-	spin_lock_irq(&percpu_counters_lock);
+	raw_spin_lock_irqsave(&percpu_counters_lock, flags);
 	list_for_each_entry(fbc, &percpu_counters, list) {
 		s32 *pcount;
 
@@ -246,7 +246,7 @@ static int percpu_counter_cpu_dead(unsigned int cpu)
 		*pcount = 0;
 		raw_spin_unlock(&fbc->lock);
 	}
-	spin_unlock_irq(&percpu_counters_lock);
+	raw_spin_unlock_irqrestore(&percpu_counters_lock, flags);
 #endif
 	return 0;
 }
@@ -331,13 +331,11 @@ bool __percpu_counter_limited_add(struct percpu_counter *fbc,
 	}
 
 	if (!good) {
-		s32 *pcount;
 		int cpu;
 
-		for_each_cpu_or(cpu, cpu_online_mask, cpu_dying_mask) {
-			pcount = per_cpu_ptr(fbc->counters, cpu);
-			count += *pcount;
-		}
+		for_each_online_cpu(cpu)
+			count += *per_cpu_ptr(fbc->counters, cpu);
+
 		if (amount > 0) {
 			if (count > limit)
 				goto out;
@@ -359,15 +357,8 @@ out:
 
 static int __init percpu_counter_startup(void)
 {
-	int ret;
-
-	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "lib/percpu_cnt:online",
-				compute_batch_value, NULL);
-	WARN_ON(ret < 0);
-	ret = cpuhp_setup_state_nocalls(CPUHP_PERCPU_CNT_DEAD,
-					"lib/percpu_cnt:dead", NULL,
-					percpu_counter_cpu_dead);
-	WARN_ON(ret < 0);
+	WARN_ON(cpuhp_setup_state(CPUHP_AP_PERCPU_COUNTER_STARTING, "lib/percpu_counter:starting",
+				  percpu_counter_cpu_starting, percpu_counter_cpu_dying));
 	return 0;
 }
 module_init(percpu_counter_startup);
